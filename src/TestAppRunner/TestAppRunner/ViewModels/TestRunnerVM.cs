@@ -134,7 +134,9 @@ namespace TestAppRunner.ViewModels
                 {
                     var tests = new Dictionary<Guid, TestResultVM>();
                     var asm = this.Settings.TestAssemblies ?? AppDomain.CurrentDomain.GetAssemblies().Where(c => !c.IsDynamic).ToArray();
-                    var references = asm.Select(c => System.IO.Path.GetFileName(c.Location)).ToArray();
+                    var references = asm.Select(c => string.IsNullOrEmpty(c.Location)
+                        ? $"{c.GetName().Name}.dll"
+                        : System.IO.Path.GetFileName(c.Location)).ToArray();
                     testRunner = new TestRunner(references, this);
                     foreach (var item in testRunner.Tests)
                     {

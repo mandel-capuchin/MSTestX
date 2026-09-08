@@ -38,6 +38,7 @@ namespace MSTestX.Console
         public string Phase { get; private set; } = "starting";
         public int SelectedTestCount { get; private set; }
         public int ResultCount { get; private set; }
+        public string LastStartedTest { get; private set; } = "(none)";
         public string LastTestResult { get; private set; } = "(none)";
         public string LastReceivedMessage { get; private set; } = "(none)";
         public string LastException { get; private set; } = "(none)";
@@ -73,6 +74,13 @@ namespace MSTestX.Console
                 duration.FormatDuration());
         }
 
+        public void RecordTestStart(string testName)
+        {
+            LastStartedTest = string.IsNullOrWhiteSpace(testName)
+                ? "(unnamed test)"
+                : testName;
+        }
+
         public void RecordException(System.Exception exception)
         {
             LastException = exception?.GetType().Name + ": " + exception?.Message;
@@ -86,6 +94,7 @@ namespace MSTestX.Console
                 $"phase={Phase}",
                 $"selectedTests={SelectedTestCount}",
                 $"results={ResultCount}",
+                $"lastStarted={LastStartedTest}",
                 $"lastResult={LastTestResult}",
                 $"lastMessage={LastReceivedMessage}",
                 $"executionCompleteReceived={ExecutionCompleteReceived}",
@@ -114,6 +123,17 @@ namespace MSTestX.Console
             : base(TestRunner.FormatCompletionFailureMessage(completion))
         {
         }
+    }
+
+    internal sealed class TestRunFailedException : Exception
+    {
+        public TestRunFailedException(long failedTestCount)
+            : base($"Test run completed with {failedTestCount} failed test(s).")
+        {
+            FailedTestCount = failedTestCount;
+        }
+
+        public long FailedTestCount { get; }
     }
 
     public class TestRunner : IDisposable
@@ -182,6 +202,13 @@ namespace MSTestX.Console
                 || completion?.IsCanceled == true;
         }
 
+        internal static bool HasFailedTests(ITestRunStatistics statistics)
+        {
+            return GetOutcomeCount(
+                statistics,
+                Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed) > 0;
+        }
+
         internal static string FormatCompletionFailureMessage(TestRunCompleteEventArgs completion)
         {
             if (completion?.Error != null)
@@ -218,6 +245,13 @@ namespace MSTestX.Console
             }
             catch (TestRunCompletedWithErrorException)
             {
+                throw;
+            }
+            catch (TestRunFailedException)
+            {
+                // Execution completed normally and the TRX logger has already received
+                // OnTestRunComplete. Preserve that completed result while making the
+                // console process fail for callers such as certification scripts.
                 throw;
             }
             catch (TestRunAbortedException)
@@ -335,6 +369,7 @@ namespace MSTestX.Console
                 {
                     var tcs = JsonDataSerializer.Instance.DeserializePayload<TestCaseStartEventArgs>(msg);
                     var testName = tcs.GetDisplayName();
+                    diagnostics.RecordTestStart(testName);
                     var parentExecId = tcs.GetParentExecId();
                     if (System.Console.IsOutputRedirected)
                     {
@@ -482,6 +517,10 @@ namespace MSTestX.Console
                     diagnostics.SetPhase(unsuccessfulCompletion ? "complete with error" : "complete");
                     if (unsuccessfulCompletion)
                         throw new TestRunCompletedWithErrorException(trc.TestRunCompleteArgs);
+                    if (HasFailedTests(statistics))
+                        throw new TestRunFailedException(GetOutcomeCount(
+                            statistics,
+                            Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed));
 
                     return; //Test run is complete -> Exit message loop
                 }
