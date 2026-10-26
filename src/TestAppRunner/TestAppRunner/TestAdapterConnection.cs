@@ -14,39 +14,36 @@
 
 #nullable enable
 using Microsoft.VisualStudio.TestPlatform.CommunicationUtilities;
+using Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.Interfaces;
 using Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.ObjectModel;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Adapter;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Client;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.DataCollection;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Logging;
 using System.Runtime.Serialization;
+using System.Threading;
 using TestAppRunner.ViewModels;
 
 namespace TestAppRunner
 {
     internal class TestAdapterConnection
     {
-        private SocketCommunicationManager comm = new SocketCommunicationManager();
-        private bool isConnected;
-        private int port;
-        private System.Threading.Thread? messageLoopThread;
+        private readonly TaskCompletionSource<object?> firstSessionConnected =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly int port;
+        private ICommunicationManager? comm;
+        private Task? acceptLoopTask;
 
         public TestAdapterConnection(int port)
         {
             this.port = port;
         }
 
-        public async Task StartAsync()
+        public async Task StartAsync(CancellationToken cancellationToken = default)
         {
-            LogLifecycle($"adapter listening on port {port}");
-            var server = comm.HostServer(new System.Net.IPEndPoint(System.Net.IPAddress.Any, port));
-            await comm.AcceptClientAsync();
-            LogLifecycle("client connected");
-            isConnected = true;
-            var tcs = new TaskCompletionSource<object?>();
-            messageLoopThread = new System.Threading.Thread(() => StartMessageLoop(tcs));
-            messageLoopThread.Start();
-            await tcs.Task;
+            acceptLoopTask ??= RunAcceptLoopAsync(cancellationToken);
+            var completedTask = await Task.WhenAny(firstSessionConnected.Task, acceptLoopTask).ConfigureAwait(false);
+            await completedTask.ConfigureAwait(false);
         }
 
         private class SettingsXmlImpl : IRunSettings
@@ -60,90 +57,134 @@ namespace TestAppRunner
             public ISettingsProvider? GetSettings(string? settingsName) => null;
         }
 
-        private Task<Message?> ReceiveMessageAsync()
+        private static async Task<Message?> ReceiveMessageAsync(
+            ICommunicationManager session,
+            CancellationToken cancellationToken)
         {
-            return Task.Run<Message?>(() =>
+            try
             {
+                var rawMessage = await Task.Run(session.ReceiveRawMessage, CancellationToken.None)
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                if (string.IsNullOrEmpty(rawMessage))
+                    throw new EndOfStreamException("The test adapter client closed the connection.");
+
+                return JsonDataSerializer.Instance.DeserializeMessage(rawMessage)
+                    ?? throw new SerializationException("The test adapter received an invalid protocol message.");
+            }
+            catch (System.IO.IOException ioException)
+                when (ioException.InnerException is System.Net.Sockets.SocketException socketException &&
+                      socketException.SocketErrorCode == System.Net.Sockets.SocketError.TimedOut)
+            {
+                System.Diagnostics.Trace.TraceInformation(
+                    $"SocketCommunicationManager ReceiveMessage: read timed out {ioException}");
+                return null;
+            }
+        }
+
+        private async Task RunAcceptLoopAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                ICommunicationManager session = new SocketCommunicationManager();
+                comm = session;
                 try
                 {
-                    var rawMessage = comm.ReceiveRawMessage();
-                    if (!string.IsNullOrEmpty(rawMessage))
-                    {
-                        return JsonDataSerializer.Instance.DeserializeMessage(rawMessage);
-                    }
+                    LogLifecycle($"adapter listening on port {port}");
+                    session.HostServer(new System.Net.IPEndPoint(System.Net.IPAddress.Any, port));
+                    await session.AcceptClientAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+                    LogLifecycle("client connected");
+                    await RunSessionAsync(session, cancellationToken).ConfigureAwait(false);
                 }
-                catch (System.IO.IOException ioException)
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    var socketException = ioException.InnerException as System.Net.Sockets.SocketException;
-                    if (socketException != null
-                        && socketException.SocketErrorCode == System.Net.Sockets.SocketError.TimedOut)
-                    {
-                        System.Diagnostics.Trace.TraceInformation($"SocketCommunicationManager ReceiveMessage: failed to receive message because read timeout {ioException}");
-                    }
-                    else
-                    {
-                        isConnected = false;
-                        System.Diagnostics.Trace.TraceError($"SocketCommunicationManager ReceiveMessage: failed to receive message {ioException}");
-                    }
+                    break;
                 }
                 catch (Exception exception)
                 {
+                    LogLifecycle($"adapter session disconnected: {exception.GetType().Name}: {exception.Message}");
                     EqtTrace.Error(
-                        "SocketCommunicationManager ReceiveMessage: failed to receive message {0}",
+                        "SocketCommunicationManager session failed: {0}",
                         exception);
                 }
-                return null;
-            });
-
-        }
-            
-        private async void StartMessageLoop(TaskCompletionSource<object?> tcs)
-        {
-            while (isConnected)
-            {
-                var message = await ReceiveMessageAsync();
-                if(message != null)
+                finally
                 {
-                    if (message.MessageType == MessageType.SessionConnected)
+                    try
                     {
-                        LogLifecycle("session connected; sending version check");
-                        // Version Check
-                        comm.SendMessage(MessageType.VersionCheck, 1);
-                        tcs.TrySetResult(null);
-                        SendTestHostLaunched();
-                        isConnected = true;
+                        session.StopServer();
                     }
-                    else if (!isConnected)
+                    catch (Exception exception)
                     {
-                        continue;
+                        LogLifecycle($"failed to stop adapter session: {exception.Message}");
                     }
-                    else if (message.MessageType == MessageType.StartDiscovery)
-                    {
-                        var req = comm.DeserializePayload<DiscoveryRequestPayload>(message);
-                        comm.SendMessage(MessageType.DiscoveryInitialize);
-                        var tests = ViewModels.TestRunnerVM.Instance.Tests;
-                        LogLifecycle($"discovery complete: tests={tests.Count()}");
-                        comm.SendMessage(MessageType.DiscoveryComplete, new
-                            DiscoveryCompletePayload() { LastDiscoveredTests = tests.Select(t => t.Test), TotalTests = tests.Count() });
-                    }
-                    else if (message.MessageType == MessageType.TestRunSelectedTestCasesDefaultHost ||
-                        message.MessageType == MessageType.TestRunAllSourcesWithDefaultHost)
-                    {
-                        var trr = comm.DeserializePayload<TestRunRequestPayload>(message);
-                        if (trr.TestCases != null)
+
+                    if (ReferenceEquals(comm, session))
+                        comm = null;
+                }
+
+                if (!cancellationToken.IsCancellationRequested)
+                    await Task.Delay(100, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        private async Task RunSessionAsync(
+            ICommunicationManager session,
+            CancellationToken cancellationToken)
+        {
+            var handshakeCompleted = false;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var message = await ReceiveMessageAsync(session, cancellationToken).ConfigureAwait(false);
+                if (message is null)
+                    continue;
+
+                if (message.MessageType == MessageType.SessionConnected)
+                {
+                    if (handshakeCompleted)
+                        throw new InvalidDataException("The test adapter received a duplicate SessionConnected message.");
+
+                    handshakeCompleted = true;
+                    LogLifecycle("session connected; sending version check");
+                    session.SendMessage(MessageType.VersionCheck, 1);
+                    session.SendMessage(
+                        MessageType.TestHostLaunched,
+                        new TestHostLaunchedPayload() { ProcessId = GetProcessId() });
+                    firstSessionConnected.TrySetResult(null);
+                }
+                else if (!handshakeCompleted)
+                {
+                    throw new InvalidDataException(
+                        $"The test adapter received '{message.MessageType}' before SessionConnected.");
+                }
+                else if (message.MessageType == MessageType.StartDiscovery)
+                {
+                    _ = session.DeserializePayload<DiscoveryRequestPayload>(message);
+                    session.SendMessage(MessageType.DiscoveryInitialize);
+                    var tests = ViewModels.TestRunnerVM.Instance.Tests;
+                    LogLifecycle($"discovery complete: tests={tests.Count()}");
+                    session.SendMessage(
+                        MessageType.DiscoveryComplete,
+                        new DiscoveryCompletePayload()
                         {
-                            var testsToRun = ViewModels.TestRunnerVM.Instance.Tests.Select(t => t.Test).Where(t => trr.TestCases.Any(t2 => t2.Id == t.Id)).ToList();
-                            _ = RunRemoteTestsAsync(testsToRun, trr.RunSettings);
-                        }
-                    }
-                    else
+                            LastDiscoveredTests = tests.Select(t => t.Test),
+                            TotalTests = tests.Count()
+                        });
+                }
+                else if (message.MessageType == MessageType.TestRunSelectedTestCasesDefaultHost ||
+                    message.MessageType == MessageType.TestRunAllSourcesWithDefaultHost)
+                {
+                    var trr = session.DeserializePayload<TestRunRequestPayload>(message);
+                    if (trr.TestCases != null)
                     {
-                        System.Diagnostics.Debug.WriteLine($"Got message: {message.MessageType}, Payload={message.Payload}");
+                        var testsToRun = ViewModels.TestRunnerVM.Instance.Tests.Select(t => t.Test).Where(t => trr.TestCases.Any(t2 => t2.Id == t.Id)).ToList();
+                        _ = RunRemoteTestsAsync(testsToRun, trr.RunSettings);
                     }
                 }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"Got message: {message.MessageType}, Payload={message.Payload}");
+                }
             }
-            comm.StopServer();
-            _ = StartAsync();
         }
 
         private async Task RunRemoteTestsAsync(List<TestCase> testsToRun, string? runSettings)
@@ -254,14 +295,17 @@ namespace TestAppRunner
         internal void SendMessage(string messageType, object payload)
         {
             var json = JsonDataSerializer.Instance.SerializePayload(messageType, payload);
-            comm.SendMessage(messageType, payload);
+            GetCurrentConnection().SendMessage(messageType, payload);
         }
 
         internal void SendMessage(string messageType)
         {
             var json = JsonDataSerializer.Instance.SerializeMessage(messageType);
-            comm.SendMessage(messageType);
+            GetCurrentConnection().SendMessage(messageType);
         }
+
+        private ICommunicationManager GetCurrentConnection() =>
+            comm ?? throw new InvalidOperationException("No test adapter client is connected.");
 
         internal void SendMessage(TestMessageLevel testMessageLevel, string message)
         {

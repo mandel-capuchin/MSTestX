@@ -21,7 +21,6 @@ using Microsoft.VisualStudio.TestPlatform.ObjectModel.Logging;
 using MSTestX.Console.Adb;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -60,6 +59,10 @@ namespace MSTestX.Console
         private static LogCatMonitor? monitor;
         private static CancellationTokenSource? processExitCancellationTokenSource;
         private static TaskCompletionSource<int> testRunCompleted = new TaskCompletionSource<int>();
+        private static int adbServerPort = 5037;
+        private static int adapterConnectionTimeoutSeconds = 60;
+        private static bool androidForwardCreated;
+        private const int TestAdapterPort = 38300;
 
         internal static LaunchMode GetLaunchMode(IReadOnlyDictionary<string, string?> arguments)
         {
@@ -98,9 +101,26 @@ namespace MSTestX.Console
                 return;
             }
 
-            await RunTest(arguments.ConsoleOptions, arguments.ApplicationArguments);
-            var exitCode = await testRunCompleted.Task;
-            Environment.Exit(exitCode);
+            try
+            {
+                System.Console.CancelKeyPress += (_, eventArgs) =>
+                {
+                    eventArgs.Cancel = true;
+                    processExitCancellationTokenSource?.Cancel();
+                    testRunCompleted.TrySetResult(1);
+                };
+                await RunTest(arguments.ConsoleOptions, arguments.ApplicationArguments);
+                Environment.ExitCode = await testRunCompleted.Task;
+            }
+            catch (Exception ex)
+            {
+                System.Console.Error.WriteLine("ERROR: " + ex.Message);
+                Environment.ExitCode = 1;
+            }
+            finally
+            {
+                await KillProcess();
+            }
         }
 
         private static void PrintUsage()
@@ -118,6 +138,8 @@ Android specific (ignored if using remoteIp):
     -apkid <id>                         Package ID of the test app (if not provided, auto-discovered from manifest)
     -activity <activity id>             Activity to launch (if not provided, auto-discovered from manifest)
     -pin <pin code>                     Pin to use to unlock your phone (or empty to just unlock phone with no pin)
+    -adbServerPort <port>               ADB smart-socket server port (default 5037)
+    -adapterConnectionTimeoutSeconds <seconds> Maximum adapter connection and handshake time (default 60)
 
 iOS physical-device specific (macOS only):
     -apppath <file path>                Path to app to install and launch
@@ -149,6 +171,11 @@ Application arguments for physical iOS launches:
             IReadOnlyList<string> applicationArguments)
         {
             processExitCancellationTokenSource = new CancellationTokenSource();
+            adbServerPort = GetValidatedIntegerOption(arguments, "adbServerPort", 5037);
+            adapterConnectionTimeoutSeconds = GetValidatedIntegerOption(
+                arguments,
+                "adapterConnectionTimeoutSeconds",
+                60);
 
             if (arguments.ContainsKey("settings") && File.Exists(arguments["settings"]))
             {
@@ -342,7 +369,7 @@ Application arguments for physical iOS launches:
                 default:
                 {
                     // Launch Android android app
-                    client = new AdbClient();
+                    client = new AdbClient(adbServerPort);
                     var devices = await client.GetDevicesAsync();
                 if (!devices.Any())
                 {
@@ -445,7 +472,7 @@ Application arguments for physical iOS launches:
                     outputFilename = Path.Combine(System.Environment.CurrentDirectory, defaultFilename + ".trx");
                 }
 
-                monitor = new LogCatMonitor(device.Serial);
+                monitor = new LogCatMonitor(device.Serial, adbServerPort);
                 // Connecting to logcat...                                
                 await client.SendDeviceCommandAsync("shell:logcat -b all -c", device.Serial); //Configure logcat
                 bool result;
@@ -460,15 +487,17 @@ Application arguments for physical iOS launches:
                 else
                 {
                     System.Console.WriteLine("Failed to connect to LogCat");
+                    testRunCompleted.TrySetResult(1);
                     return;
                 }
                 monitor.LogReceived += Monitor_LogReceived;
 
-                await device.SetPortForward(38300, 38300);  //Set up port forwarding for socket communication
+                await device.SetPortForward(TestAdapterPort, TestAdapterPort);  //Set up port forwarding for socket communication
+                androidForwardCreated = true;
                 
                 System.Console.WriteLine($"Launching app {apk_id}/{activityName} on device " + device.Serial + "...");
 
-                await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", 38300 } });
+                await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", TestAdapterPort } });
                
                 // Keep looking for process starting up
                 bool launched = false;
@@ -488,7 +517,7 @@ Application arguments for physical iOS launches:
                     else
                     {
                         //Keep retrying. Doesn't always launch the first time
-                        await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", 38300 } });
+                        await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", TestAdapterPort } });
                     }
                 }
 
@@ -522,7 +551,9 @@ Application arguments for physical iOS launches:
                 return;
             appLaunchDetected = true;
             int result = 0;
-            var runner = new TestRunner(endpoint);
+            var runner = new TestRunner(
+                endpoint,
+                TimeSpan.FromSeconds(adapterConnectionTimeoutSeconds));
             try
             {
                 await Task.Delay(5000); //Give app some time to start up
@@ -533,24 +564,52 @@ Application arguments for physical iOS launches:
                 System.Console.WriteLine(ex.Message);
                 result = 1;
             }
-            finally
-            {
-                await KillProcess();
-            }
             testRunCompleted.TrySetResult(result);
         }
 
         private static async Task KillProcess()
         {
+            var cleanupSteps = new List<(string Name, Func<Task> Action)>();
             if (monitor != null)
             {
-                monitor.LogReceived -= Monitor_LogReceived;
+                cleanupSteps.Add(("close logcat monitor", () =>
+                {
+                    monitor.LogReceived -= Monitor_LogReceived;
+                    monitor.Close();
+                    monitor = null;
+                    return Task.CompletedTask;
+                }));
             }
-            if (device != null)
+            if (device != null && !string.IsNullOrWhiteSpace(apk_id))
             {
-                await device.StopApp(apk_id);
+                cleanupSteps.Add(("force-stop Android test app", () => device.StopApp(apk_id)));
             }
-            monitor?.Close();
+            if (device != null && androidForwardCreated)
+            {
+                cleanupSteps.Add(($"remove tcp:{TestAdapterPort} forward", async () =>
+                {
+                    await device.RemovePortForward(TestAdapterPort);
+                    androidForwardCreated = false;
+                }));
+            }
+
+            await RunCleanupStepsAsync(cleanupSteps);
+        }
+
+        internal static async Task RunCleanupStepsAsync(
+            IEnumerable<(string Name, Func<Task> Action)> cleanupSteps)
+        {
+            foreach (var cleanupStep in cleanupSteps)
+            {
+                try
+                {
+                    await cleanupStep.Action().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    System.Console.Error.WriteLine($"Failed to {cleanupStep.Name}: {ex.Message}");
+                }
+            }
         }
 
         private static int processID = -1;
@@ -682,7 +741,35 @@ Application arguments for physical iOS launches:
                 }
             }
 
+            ValidateIntegerOption(result, "adbServerPort", maximum: 65535);
+            ValidateIntegerOption(result, "adapterConnectionTimeoutSeconds");
+
             return new ParsedArguments(result, applicationArguments);
+        }
+
+        private static void ValidateIntegerOption(
+            IReadOnlyDictionary<string, string?> arguments,
+            string optionName,
+            int maximum = int.MaxValue)
+        {
+            if (!arguments.TryGetValue(optionName, out var value))
+                return;
+
+            if (!int.TryParse(value, out var parsedValue) || parsedValue <= 0 || parsedValue > maximum)
+            {
+                throw new ArgumentException(
+                    $"-{optionName} must be an integer between 1 and {maximum}.");
+            }
+        }
+
+        private static int GetValidatedIntegerOption(
+            IReadOnlyDictionary<string, string?> arguments,
+            string optionName,
+            int defaultValue)
+        {
+            return arguments.TryGetValue(optionName, out var value)
+                ? int.Parse(value!, System.Globalization.CultureInfo.InvariantCulture)
+                : defaultValue;
         }
 
         private static void ValidateApplicationArguments(IReadOnlyList<string> applicationArguments)

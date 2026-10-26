@@ -108,14 +108,13 @@ namespace TestAppRunner.ViewModels
         {
             OnPropertyChanged(nameof(Status));
             //TODO: Get iOS mlaunch port number
-            var conn = new TestAdapterConnection(port);
+            connection = new TestAdapterConnection(port);
             if (!string.IsNullOrEmpty(Settings.RemoteHost))
                 PingHost(Settings.RemoteHost);
 
             try
             {
-                await conn.StartAsync();
-                connection = conn;
+                await connection.StartAsync();
                 ShowToast("Remote test adapter connected!");
             }
             catch (System.Exception ex)

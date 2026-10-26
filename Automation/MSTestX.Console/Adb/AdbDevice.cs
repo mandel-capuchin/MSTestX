@@ -145,8 +145,15 @@ namespace MSTestX.Console.Adb
         /// <returns></returns>
         public Task SetPortForward(int fromPort, int toPort)
         {
-
             return _client.SendCommandAsync($"host-serial:{Serial}:forward:tcp:{fromPort};tcp:{toPort}");
+        }
+
+        /// <summary>
+        /// Removes the exact local TCP forward owned by this runner.
+        /// </summary>
+        public Task RemovePortForward(int localPort)
+        {
+            return _client.SendCommandAsync($"host-serial:{Serial}:killforward:tcp:{localPort}");
         }
             
         public async Task TurnOnDisplayAsync()

@@ -388,6 +388,26 @@ public class TestRunnerTests
     }
 
     [TestMethod]
+    public void CompletedAssertionFailures_AreNotAnInfrastructureFailure()
+    {
+        var completion = new TestRunCompleteEventArgs(
+            new TestRunStatistics(
+                executedTests: 2,
+                new Dictionary<TestOutcome, long>
+                {
+                    [TestOutcome.Passed] = 1,
+                    [TestOutcome.Failed] = 1
+                }),
+            false,
+            false,
+            null,
+            null,
+            TimeSpan.FromSeconds(1));
+
+        Assert.IsFalse(TestRunner.IsUnsuccessfulCompletion(completion));
+    }
+
+    [TestMethod]
     public void TestRunCompletedWithErrorException_UsesCompletionFailureMessage()
     {
         var completion = new TestRunCompleteEventArgs(
@@ -401,15 +421,6 @@ public class TestRunnerTests
         var exception = new TestRunCompletedWithErrorException(completion);
 
         Assert.AreEqual("Test run completed with error: boom", exception.Message);
-    }
-
-    [TestMethod]
-    public void TestRunFailedException_ReportsFailedTestCount()
-    {
-        var exception = new TestRunFailedException(2);
-
-        Assert.AreEqual(2, exception.FailedTestCount);
-        Assert.AreEqual("Test run completed with 2 failed test(s).", exception.Message);
     }
 
     [TestMethod]

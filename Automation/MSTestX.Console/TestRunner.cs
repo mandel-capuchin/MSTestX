@@ -125,21 +125,11 @@ namespace MSTestX.Console
         }
     }
 
-    internal sealed class TestRunFailedException : Exception
-    {
-        public TestRunFailedException(long failedTestCount)
-            : base($"Test run completed with {failedTestCount} failed test(s).")
-        {
-            FailedTestCount = failedTestCount;
-        }
-
-        public long FailedTestCount { get; }
-    }
-
     public class TestRunner : IDisposable
     {
         private SocketCommunicationManager socket;
-        private System.Net.IPEndPoint _endpoint;
+        private readonly System.Net.IPEndPoint _endpoint;
+        private readonly TimeSpan _adapterConnectionTimeout;
         private TestRunDiagnostics diagnostics = new TestRunDiagnostics(null);
 
         internal static string GetRedirectedOutcomeLabel(Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome outcome)
@@ -221,9 +211,14 @@ namespace MSTestX.Console
             return "Test run completed successfully.";
         }
 
-        public TestRunner(System.Net.IPEndPoint endpoint = null)
+        public TestRunner(
+            System.Net.IPEndPoint endpoint = null,
+            TimeSpan? adapterConnectionTimeout = null)
         {
             _endpoint = endpoint;
+            _adapterConnectionTimeout = adapterConnectionTimeout ?? TimeSpan.FromSeconds(60);
+            if (_adapterConnectionTimeout <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(adapterConnectionTimeout));
         }
 
         public async Task RunTests(
@@ -245,13 +240,6 @@ namespace MSTestX.Console
             }
             catch (TestRunCompletedWithErrorException)
             {
-                throw;
-            }
-            catch (TestRunFailedException)
-            {
-                // Execution completed normally and the TRX logger has already received
-                // OnTestRunComplete. Preserve that completed result while making the
-                // console process fail for callers such as certification scripts.
                 throw;
             }
             catch (TestRunAbortedException)
@@ -283,39 +271,38 @@ namespace MSTestX.Console
         {
             diagnostics.SetPhase("connecting to test adapter");
             System.Console.WriteLine("Waiting for connection to test adapter...");
-            for (int i = 1; i <= 10; i++)
+            using var connectionTimeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            connectionTimeoutSource.CancelAfter(_adapterConnectionTimeout);
+            try
             {
                 socket = new SocketCommunicationManager();
-                await socket.SetupClientAsync(_endpoint ?? new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 38300)).ConfigureAwait(false);
-                if (!socket.WaitForServerConnection(10000))
-                {
-                    if (i == 10)
-                    {
-                        throw new Exception("No connection to test host could be established. Make sure the app is running in the foreground.");
-                    }
-                    else
-                    {
-                        System.Console.WriteLine($"Retrying connection.... ({i} of 10)");
-                        continue;
-                    }
-                }
-                break;
-            }
-            socket.SendMessage(MessageType.SessionConnected); //Start session
+                await socket.SetupClientAsync(
+                        _endpoint ?? new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 38300))
+                    .WaitAsync(connectionTimeoutSource.Token)
+                    .ConfigureAwait(false);
+                if (!socket.WaitForServerConnection(0))
+                    throw new IOException("The test adapter socket did not report a completed connection.");
 
-            //Perform version handshake
-            diagnostics.SetPhase("waiting for version check");
-            Message msg = await ReceiveMessageAsync(cancellationToken);
-            if (msg?.MessageType == MessageType.VersionCheck)
-            {
-                var version = JsonDataSerializer.Instance.DeserializePayload<int>(msg);
-                var success = version == 1;
+                socket.SendMessage(MessageType.SessionConnected); //Start session
+
+                //Perform version handshake
+                diagnostics.SetPhase("waiting for version check");
+                Message handshakeMessage = await ReceiveMessageAsync(connectionTimeoutSource.Token).ConfigureAwait(false);
+                if (handshakeMessage?.MessageType != MessageType.VersionCheck)
+                    throw new InvalidOperationException("Handshake failed: the adapter did not send VersionCheck.");
+
+                _ = JsonDataSerializer.Instance.DeserializePayload<int>(handshakeMessage);
                 System.Console.WriteLine("Connected to test adapter");
             }
-            else
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
-                throw new InvalidOperationException("Handshake failed");
+                socket?.StopClient();
+                throw new TimeoutException(
+                    $"Timed out after {_adapterConnectionTimeout.TotalSeconds:0} seconds waiting for the test adapter connection and VersionCheck handshake. " +
+                    "Verify that the app is running, tcp:38300 is forwarded through the selected ADB server, and the device is online.");
             }
+
+            Message msg;
 
             // Get tests
             diagnostics.SetPhase("requesting discovery");
@@ -517,11 +504,6 @@ namespace MSTestX.Console
                     diagnostics.SetPhase(unsuccessfulCompletion ? "complete with error" : "complete");
                     if (unsuccessfulCompletion)
                         throw new TestRunCompletedWithErrorException(trc.TestRunCompleteArgs);
-                    if (HasFailedTests(statistics))
-                        throw new TestRunFailedException(GetOutcomeCount(
-                            statistics,
-                            Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed));
-
                     return; //Test run is complete -> Exit message loop
                 }
                 else if (msg.MessageType == MessageType.AbortTestRun)
@@ -561,54 +543,55 @@ namespace MSTestX.Console
             cancellationToken.ThrowIfCancellationRequested();
         }
 
-        private Task<Message> ReceiveMessageAsync(CancellationToken cancellationToken)
+        private async Task<Message> ReceiveMessageAsync(CancellationToken cancellationToken)
         {
-            return Task.Run<Message>(() =>
+            cancellationToken.ThrowIfCancellationRequested();
+            try
             {
-                Message msg = null;
-                // Set read timeout to avoid blocking receive raw message
-                while (!cancellationToken.IsCancellationRequested)
+                var msg = await Task.Run(socket.ReceiveMessage, CancellationToken.None)
+                    .WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                if (msg is null)
                 {
-                    try
-                    {
-                        msg = socket.ReceiveMessage();
-                        cancellationToken.ThrowIfCancellationRequested();
-                        if (msg != null)
-                        {
-                            diagnostics.RecordMessage(msg.MessageType);
-                            return msg;
-                        }
-                    }
-                    catch (EndOfStreamException endofStreamException)
-                    {
-                        diagnostics.SetPhase("adapter disconnected");
-                        throw new TestRunAbortedException(diagnostics, endofStreamException);
-                    }
-                    catch (IOException ioException)
-                    {
-                        var socketException = ioException.InnerException as SocketException;
-                        if (socketException != null && socketException.SocketErrorCode == SocketError.TimedOut)
-                        {
-                            throw new Exception("Test runner connection timed out", ioException);
-                        }
-                        else
-                        {
-                            continue;
-                        }
-                    }
-                    catch (System.Exception ex)
-                    {
-                        System.Console.WriteLine("Failed to receive message : " + ex.Message);
-                        continue;
-                    }
+                    throw new EndOfStreamException(
+                        "The test adapter closed the connection without sending a message.");
                 }
+
+                diagnostics.RecordMessage(msg.MessageType);
                 return msg;
-            });
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (EndOfStreamException endOfStreamException)
+            {
+                diagnostics.SetPhase("adapter disconnected");
+                throw new TestRunAbortedException(diagnostics, endOfStreamException);
+            }
+            catch (IOException ioException)
+            {
+                if (ioException.InnerException is SocketException socketException &&
+                    socketException.SocketErrorCode == SocketError.TimedOut)
+                {
+                    diagnostics.SetPhase("adapter receive timeout");
+                }
+                else
+                {
+                    diagnostics.SetPhase("adapter I/O failure");
+                }
+                throw new TestRunAbortedException(diagnostics, ioException);
+            }
+            catch (Exception exception)
+            {
+                diagnostics.SetPhase("adapter protocol failure");
+                throw new TestRunAbortedException(diagnostics, exception);
+            }
         }
 
         public void Dispose()
         {
-            socket.StopClient();
+            socket?.StopClient();
         }
 
         private class TestLoggerEventsImpl : TestLoggerEvents
