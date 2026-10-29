@@ -101,28 +101,63 @@ namespace MSTestX.Console
             mobileDeviceProcess = null;
         }
 
-        private async Task StartTunnelAsync(int fromPort, int toPort, string uuid)
+        private async Task StartTunnelAsync(
+            int fromPort,
+            int toPort,
+            string uuid,
+            CancellationToken cancellationToken)
         {
             Process.Start("pkill", "mobiledevice"); // Ensure mobiledevice isn't already running
-            await Task.Delay(100);
-            tunnelCompletion = new TaskCompletionSource();
+            await Task.Delay(100, cancellationToken);
+            tunnelCompletion = new TaskCompletionSource(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             var completion = tunnelCompletion;
             var process = mobileDeviceProcess ?? throw new ObjectDisposedException(nameof(MobileDevice));
             process.StartInfo.Arguments = $"tunnel -u {uuid} {fromPort} {toPort}";
-            CancellationTokenSource tcs = new CancellationTokenSource();
-            tcs.CancelAfter(5000);
-            tcs.Token.Register(() => completion.TrySetException(new TimeoutException()));
+            using var timeoutCancellationTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                timeoutCancellationTokenSource.Token);
             process.Start();
+            using var cancellationRegistration = linkedCancellationTokenSource.Token.Register(() =>
+            {
+                if (cancellationToken.IsCancellationRequested)
+                    completion.TrySetCanceled(cancellationToken);
+                else
+                    completion.TrySetException(new TimeoutException());
+
+                try
+                {
+                    if (!process.HasExited)
+                        process.Kill(entireProcessTree: true);
+                }
+                catch (Exception exception)
+                {
+                    Debug.WriteLine($"Failed to stop mobiledevice after cancellation: {exception.Message}");
+                }
+            });
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             await completion.Task;
         }
 
-        public static async Task<MobileDevice> CreateTunnelAsync(int fromPort, int toPort, string uuid)
+        public static async Task<MobileDevice> CreateTunnelAsync(
+            int fromPort,
+            int toPort,
+            string uuid,
+            CancellationToken cancellationToken = default)
         {
             var mobileDevice = new MobileDevice();
-            await mobileDevice.StartTunnelAsync(fromPort, toPort, uuid);
-            return mobileDevice;
+            try
+            {
+                await mobileDevice.StartTunnelAsync(fromPort, toPort, uuid, cancellationToken);
+                return mobileDevice;
+            }
+            catch
+            {
+                mobileDevice.Dispose();
+                throw;
+            }
         }
 
         public void Dispose()

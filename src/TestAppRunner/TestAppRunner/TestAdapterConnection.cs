@@ -87,18 +87,29 @@ namespace TestAppRunner
             while (!cancellationToken.IsCancellationRequested)
             {
                 ICommunicationManager session = new SocketCommunicationManager();
+                var clientAccepted = false;
                 comm = session;
                 try
                 {
                     LogLifecycle($"adapter listening on port {port}");
                     session.HostServer(new System.Net.IPEndPoint(System.Net.IPAddress.Any, port));
                     await session.AcceptClientAsync().WaitAsync(cancellationToken).ConfigureAwait(false);
+                    clientAccepted = true;
                     LogLifecycle("client connected");
                     await RunSessionAsync(session, cancellationToken).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
                     break;
+                }
+                catch (Exception exception)
+                    when (!clientAccepted && !firstSessionConnected.Task.IsCompleted)
+                {
+                    LogLifecycle($"adapter listener failed: {exception.GetType().Name}: {exception.Message}");
+                    EqtTrace.Error(
+                        "SocketCommunicationManager listener failed: {0}",
+                        exception);
+                    throw;
                 }
                 catch (Exception exception)
                 {

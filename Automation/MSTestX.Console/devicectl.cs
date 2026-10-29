@@ -39,25 +39,31 @@ namespace MSTestX.Console
             }
         }
 
-        public static Task<DeviceCtl.DeviceDetails> GetDeviceDetails(string deviceId)
+        public static Task<DeviceCtl.DeviceDetails> GetDeviceDetails(
+            string deviceId,
+            CancellationToken cancellationToken = default)
         {
             return DeviceCtl<DeviceCtl.DeviceDetails>(
                 new[] { "device", "info", "details", "--device", deviceId },
-                CancellationToken.None);
+                cancellationToken);
         }
 
-        public static Task<DeviceCtl.Devices> GetConnectedAppleDevicesAsync()
+        public static Task<DeviceCtl.Devices> GetConnectedAppleDevicesAsync(
+            CancellationToken cancellationToken = default)
         {
             return DeviceCtl<DeviceCtl.Devices>(
                 new[] { "list", "devices", "--timeout", "5" },
-                CancellationToken.None);
+                cancellationToken);
         }
 
-        public static async Task<string> InstallApp(string deviceId, string appPath)
+        public static async Task<string> InstallApp(
+            string deviceId,
+            string appPath,
+            CancellationToken cancellationToken = default)
         {
             var output = await DeviceCtl(
                 new[] { "device", "install", "app", "--device", deviceId, appPath },
-                CancellationToken.None);
+                cancellationToken);
             var idLine = output.Split(Environment.NewLine).Where(s => s.Contains("bundleID: ")).FirstOrDefault();
             if(string.IsNullOrEmpty(idLine))
             {
@@ -132,10 +138,16 @@ namespace MSTestX.Console
                 "--json-output",
                 tmpPath
             };
-            await DeviceCtl(jsonArguments, cancellationToken);
-            var json = System.IO.File.ReadAllText(tmpPath);
-            File.Delete(tmpPath);
-            return System.Text.Json.JsonSerializer.Deserialize<T>(json)!;
+            try
+            {
+                await DeviceCtl(jsonArguments, cancellationToken);
+                var json = System.IO.File.ReadAllText(tmpPath);
+                return System.Text.Json.JsonSerializer.Deserialize<T>(json)!;
+            }
+            finally
+            {
+                File.Delete(tmpPath);
+            }
         }
 
         private static Task<string> DeviceCtl(
@@ -146,18 +158,17 @@ namespace MSTestX.Console
             return DeviceCtl(CreateProcessStartInfo(arguments), cancellationToken, stdOutputFile);
         }
 
-        private static Task<string> DeviceCtl(
+        private static async Task<string> DeviceCtl(
             ProcessStartInfo startInfo,
             CancellationToken cancellationToken,
             string? stdOutputFile = null)
         {
-            TaskCompletionSource<string> tcs = new TaskCompletionSource<string>();
+            TaskCompletionSource<string> tcs = new TaskCompletionSource<string>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             Process xcrun = new Process
             {
                 StartInfo = startInfo
             };
-            if (cancellationToken.CanBeCanceled)
-                cancellationToken.Register(() => { tcs.TrySetCanceled(); xcrun.Close(); });
             xcrun.EnableRaisingEvents = true;
             StringBuilder sb = new StringBuilder();
             object outputLock = new object();
@@ -166,7 +177,9 @@ namespace MSTestX.Console
             xcrun.Exited += (s, e) =>
             {
                 var output = SnapshotProcessOutput(sb, outputLock);
-                if(xcrun.ExitCode > 0)
+                if (cancellationToken.IsCancellationRequested)
+                    tcs.TrySetCanceled(cancellationToken);
+                else if(xcrun.ExitCode > 0)
                     tcs.TrySetException(new Exception(output));
                 else
                     tcs.TrySetResult(output);
@@ -183,10 +196,34 @@ namespace MSTestX.Console
                 AppendProcessOutput(sb, outputLock, stdOutputFile, e.Data);
             };
             xcrun.Start();
+            CancellationTokenRegistration cancellationRegistration = default;
+            if (cancellationToken.CanBeCanceled)
+            {
+                cancellationRegistration = cancellationToken.Register(() =>
+                {
+                    try
+                    {
+                        if (!xcrun.HasExited)
+                            xcrun.Kill(entireProcessTree: true);
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.WriteLine($"Failed to stop devicectl after cancellation: {exception.Message}");
+                        tcs.TrySetCanceled(cancellationToken);
+                    }
+                });
+            }
             xcrun.BeginErrorReadLine();
             xcrun.BeginOutputReadLine();
 
-            return tcs.Task;
+            try
+            {
+                return await tcs.Task.ConfigureAwait(false);
+            }
+            finally
+            {
+                cancellationRegistration.Dispose();
+            }
         }
 
         private static void PrepareOutputFile(string? outputFile)

@@ -101,16 +101,27 @@ namespace MSTestX.Console
                 return;
             }
 
+            using var processCancellationTokenSource = new CancellationTokenSource();
+            processExitCancellationTokenSource = processCancellationTokenSource;
+            System.ConsoleCancelEventHandler cancelKeyPressHandler = (_, eventArgs) =>
+            {
+                eventArgs.Cancel = true;
+                processCancellationTokenSource.Cancel();
+                testRunCompleted.TrySetResult(1);
+            };
+            System.Console.CancelKeyPress += cancelKeyPressHandler;
             try
             {
-                System.Console.CancelKeyPress += (_, eventArgs) =>
-                {
-                    eventArgs.Cancel = true;
-                    processExitCancellationTokenSource?.Cancel();
-                    testRunCompleted.TrySetResult(1);
-                };
-                await RunTest(arguments.ConsoleOptions, arguments.ApplicationArguments);
+                await RunTest(
+                    arguments.ConsoleOptions,
+                    arguments.ApplicationArguments,
+                    processCancellationTokenSource.Token);
                 Environment.ExitCode = await testRunCompleted.Task;
+            }
+            catch (OperationCanceledException) when (processCancellationTokenSource.IsCancellationRequested)
+            {
+                System.Console.Error.WriteLine("Test run canceled.");
+                Environment.ExitCode = 1;
             }
             catch (Exception ex)
             {
@@ -119,7 +130,9 @@ namespace MSTestX.Console
             }
             finally
             {
+                System.Console.CancelKeyPress -= cancelKeyPressHandler;
                 await KillProcess();
+                processExitCancellationTokenSource = null;
             }
         }
 
@@ -168,9 +181,9 @@ Application arguments for physical iOS launches:
 
         static async Task RunTest(
             IReadOnlyDictionary<string, string?> arguments,
-            IReadOnlyList<string> applicationArguments)
+            IReadOnlyList<string> applicationArguments,
+            CancellationToken cancellationToken)
         {
-            processExitCancellationTokenSource = new CancellationTokenSource();
             adbServerPort = GetValidatedIntegerOption(arguments, "adbServerPort", 5037);
             adapterConnectionTimeoutSeconds = GetValidatedIntegerOption(
                 arguments,
@@ -191,41 +204,34 @@ Application arguments for physical iOS launches:
             System.Net.IPEndPoint? testAdapterEndpoint = null;
             if (arguments.ContainsKey("waitForRemote"))
             {
-                var pingTask = new TaskCompletionSource<bool>();
                 var pingListener = new TcpListener(System.Net.IPAddress.Any, 38302);
-                pingListener.Start();
                 System.Console.WriteLine("Waiting for remote ping...");
-                CancellationTokenSource cts = new CancellationTokenSource();
+                TimeSpan timeout;
                 if (arguments.ContainsKey("waitForRemoteTimeout"))
                 {
                     if(int.TryParse(arguments["waitForRemoteTimeout"], out int timeoutSeconds))
-                        cts.CancelAfter(timeoutSeconds * 1000);
+                        timeout = TimeSpan.FromSeconds(timeoutSeconds);
                     else
                     {
                         System.Console.WriteLine($"Invalid timeout value '{arguments["waitForRemoteTimeout"]}'.");
-                        Environment.Exit(1);
+                        testRunCompleted.TrySetResult(1);
                         return;
                     }
                 }
                 else
-                    cts.CancelAfter(10 * 60 * 5); // default 5 minute timeout
+                    timeout = TimeSpan.FromMinutes(5);
                 try
                 {
-                    var pingTaskResult = await pingListener.AcceptTcpClientAsync(cts.Token);
-                    testAdapterEndpoint = (System.Net.IPEndPoint)pingTaskResult.Client.RemoteEndPoint!;
-                    if (testAdapterEndpoint != null)
-                    {
-                        testAdapterEndpoint.Port = 38300;
-                        pingListener.Stop();
-                        System.Console.WriteLine($"Remote device connected from {testAdapterEndpoint}. Starting test run...");
-                    }
-                    else return;
+                    testAdapterEndpoint = await WaitForRemoteEndpointAsync(
+                        pingListener,
+                        timeout,
+                        cancellationToken);
+                    System.Console.WriteLine($"Remote device connected from {testAdapterEndpoint}. Starting test run...");
                 }
-                catch (OperationCanceledException)
+                catch (TimeoutException)
                 {
-                    cts.Dispose();
                     System.Console.WriteLine("Timeout waiting for remote device to connect");
-                    Environment.Exit(1);
+                    testRunCompleted.TrySetResult(1);
                     return;
                 }
             }
@@ -262,7 +268,7 @@ Application arguments for physical iOS launches:
                         string defaultFilename = DateTime.Now.ToString("yyyy-MM-dd_HH_mm_ss");
                         outputFilename = Path.Combine(System.Environment.CurrentDirectory, defaultFilename + ".trx");
                     }
-                    await OnApplicationLaunched(testAdapterEndpoint);
+                    await OnApplicationLaunched(testAdapterEndpoint, cancellationToken: cancellationToken);
                     return;
                 }
 
@@ -274,7 +280,7 @@ Application arguments for physical iOS launches:
                         testRunCompleted.TrySetResult(1);
                         return;
                     }
-                    var devices = await devicectl.GetConnectedAppleDevicesAsync();
+                    var devices = await devicectl.GetConnectedAppleDevicesAsync(cancellationToken);
 #if DEBUG
                     System.Console.WriteLine("Connected devices: ");
                     foreach (var d in devices.Result.Devices)
@@ -303,7 +309,7 @@ Application arguments for physical iOS launches:
                         testRunCompleted.TrySetResult(1);
                         return;
                     }
-                    var details = await devicectl.GetDeviceDetails(device);
+                    var details = await devicectl.GetDeviceDetails(device, cancellationToken);
                     var apppath = arguments["apppath"];
                     if (!Directory.Exists(apppath) && !File.Exists(apppath))
                     {
@@ -312,7 +318,7 @@ Application arguments for physical iOS launches:
                         return;
                     }
                     System.Console.WriteLine("Installing app...");
-                    var bundleId = await devicectl.InstallApp(device, apppath);
+                    var bundleId = await devicectl.InstallApp(device, apppath, cancellationToken);
                     System.Console.WriteLine($"App {bundleId} installed");
 
                     if (string.IsNullOrEmpty(outputFilename))
@@ -327,7 +333,11 @@ Application arguments for physical iOS launches:
                     MobileDevice tunnel;
                     try
                     {
-                        tunnel = await MobileDevice.CreateTunnelAsync(38300, 38300, details.Result.HardwareProperties.Udid);
+                        tunnel = await MobileDevice.CreateTunnelAsync(
+                            38300,
+                            38300,
+                            details.Result.HardwareProperties.Udid,
+                            cancellationToken);
                     }
                     catch (System.Exception ex)
                     {
@@ -359,7 +369,10 @@ Application arguments for physical iOS launches:
                         else
                             System.Console.WriteLine("iOS app console capture completed.");
                     });
-                    await OnApplicationLaunched(System.Net.IPEndPoint.Parse("127.0.0.1:38300"), appLogFilename);
+                    await OnApplicationLaunched(
+                        System.Net.IPEndPoint.Parse("127.0.0.1:38300"),
+                        appLogFilename,
+                        cancellationToken);
                     GC.KeepAlive(tunnel);
                     closeAppToken.Cancel();
                     testRunCompleted.TrySetResult(0);
@@ -370,7 +383,7 @@ Application arguments for physical iOS launches:
                 {
                     // Launch Android android app
                     client = new AdbClient(adbServerPort);
-                    var devices = await client.GetDevicesAsync();
+                    var devices = await client.GetDevicesAsync().WaitAsync(cancellationToken);
                 if (!devices.Any())
                 {
                     System.Console.WriteLine("No devices connected to ADB");
@@ -406,7 +419,7 @@ Application arguments for physical iOS launches:
                 if (arguments.ContainsKey("activity"))
                     activityName = arguments["activity"];
 
-                await ShutdownApp();
+                await ShutdownApp(cancellationToken);
 
                 if (arguments.ContainsKey("apkpath"))
                 {
@@ -427,19 +440,19 @@ Application arguments for physical iOS launches:
                             activityName = name;
                     }
                     System.Console.WriteLine("Installing app...");
-                    await device.InstallApk(path);
+                    await device.InstallApk(path).WaitAsync(cancellationToken);
                 }
 
                 // Get unlock state
-                var state = await device.GetPowerState();
+                var state = await device.GetPowerState().WaitAsync(cancellationToken);
                 if (!state.IsDisplayOn)
                 {
-                    await device.TurnOnDisplayAsync();
+                    await device.TurnOnDisplayAsync().WaitAsync(cancellationToken);
 
                     while (!state.IsDisplayOn)
                     {
-                        await Task.Delay(500);
-                        state = await device.GetPowerState();
+                        await Task.Delay(500, cancellationToken);
+                        state = await device.GetPowerState().WaitAsync(cancellationToken);
                     }
                 }
 
@@ -453,7 +466,7 @@ Application arguments for physical iOS launches:
                             pin = arguments["pin"];
                         }
                         System.Console.WriteLine("Unlocking phone...");
-                        await device.UnlockAsync(pin);
+                        await device.UnlockAsync(pin).WaitAsync(cancellationToken);
                     }
                     else
                     {
@@ -474,12 +487,12 @@ Application arguments for physical iOS launches:
 
                 monitor = new LogCatMonitor(device.Serial, adbServerPort);
                 // Connecting to logcat...                                
-                await client.SendDeviceCommandAsync("shell:logcat -b all -c", device.Serial); //Configure logcat
+                await client.SendDeviceCommandAsync("shell:logcat -b all -c", device.Serial).WaitAsync(cancellationToken); //Configure logcat
                 bool result;
                 if (device.ApiLevel > 22)
-                    result = await monitor.OpenAsync($"{apk_id} -T 1");
+                    result = await monitor.OpenAsync($"{apk_id} -T 1").WaitAsync(cancellationToken);
                 else
-                    result = await monitor.OpenAsync($"");
+                    result = await monitor.OpenAsync($"").WaitAsync(cancellationToken);
                 if (result)
                 {
                     System.Console.WriteLine("Connected logcat to " + device.Serial);
@@ -492,32 +505,33 @@ Application arguments for physical iOS launches:
                 }
                 monitor.LogReceived += Monitor_LogReceived;
 
-                await device.SetPortForward(TestAdapterPort, TestAdapterPort);  //Set up port forwarding for socket communication
+                await device.SetPortForward(TestAdapterPort, TestAdapterPort).WaitAsync(cancellationToken);  //Set up port forwarding for socket communication
                 androidForwardCreated = true;
                 
                 System.Console.WriteLine($"Launching app {apk_id}/{activityName} on device " + device.Serial + "...");
 
-                await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", TestAdapterPort } });
+                await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", TestAdapterPort } }).WaitAsync(cancellationToken);
                
                 // Keep looking for process starting up
                 bool launched = false;
                 while (!launched)
                 {
-                    await Task.Delay(1000);
-                    var pid = await device.GetProcessId(apk_id);
+                    await Task.Delay(1000, cancellationToken);
+                    var pid = await device.GetProcessId(apk_id).WaitAsync(cancellationToken);
                     if (appLaunchDetected)
                         break;
                     if (pid > 0)
                     {
                         launched = true;
                         System.Console.WriteLine($"Test Host Launched. Process ID '{pid}'");
-                        _ = OnApplicationLaunched();
+                        _ = OnApplicationLaunched(
+                            cancellationToken: cancellationToken);
                         break;
                     }
                     else
                     {
                         //Keep retrying. Doesn't always launch the first time
-                        await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", TestAdapterPort } });
+                        await device.LaunchApp(apk_id, activityName, new Dictionary<string, object>() { { "TestAdapterPort", TestAdapterPort } }).WaitAsync(cancellationToken);
                     }
                 }
 
@@ -526,17 +540,46 @@ Application arguments for physical iOS launches:
             }
         }
 
-        private static async Task ShutdownApp()
+        internal static async Task<System.Net.IPEndPoint> WaitForRemoteEndpointAsync(
+            TcpListener pingListener,
+            TimeSpan timeout,
+            CancellationToken cancellationToken)
+        {
+            pingListener.Start();
+            using var timeoutCancellationTokenSource = new CancellationTokenSource(timeout);
+            using var linkedCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                timeoutCancellationTokenSource.Token);
+            try
+            {
+                using var pingClient = await pingListener.AcceptTcpClientAsync(
+                    linkedCancellationTokenSource.Token);
+                var remoteEndpoint = (System.Net.IPEndPoint)pingClient.Client.RemoteEndPoint!;
+                return new System.Net.IPEndPoint(remoteEndpoint.Address, TestAdapterPort);
+            }
+            catch (OperationCanceledException) when (
+                timeoutCancellationTokenSource.IsCancellationRequested &&
+                !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException("Timed out waiting for a remote test host.");
+            }
+            finally
+            {
+                pingListener.Stop();
+            }
+        }
+
+        private static async Task ShutdownApp(CancellationToken cancellationToken)
         {
             if (device is null) return;
-            var id = await device.GetProcessId(apk_id);
+            var id = await device.GetProcessId(apk_id).WaitAsync(cancellationToken);
             if (id > 0)
             {
                 System.Console.WriteLine($"Application '{apk_id}' already running. Shutting down...");
-                await device.StopApp(apk_id); //Ensure app isn't already running
-                while (await device.GetProcessId(apk_id) > 0)
+                await device.StopApp(apk_id).WaitAsync(cancellationToken); //Ensure app isn't already running
+                while (await device.GetProcessId(apk_id).WaitAsync(cancellationToken) > 0)
                 {
-                    await Task.Delay(100);
+                    await Task.Delay(100, cancellationToken);
                 }
             }
         }
@@ -545,7 +588,8 @@ Application arguments for physical iOS launches:
 
         private static async Task OnApplicationLaunched(
             System.Net.IPEndPoint? endpoint = null,
-            string? appLogFilename = null)
+            string? appLogFilename = null,
+            CancellationToken cancellationToken = default)
         {
             if (appLaunchDetected)
                 return;
@@ -558,8 +602,8 @@ Application arguments for physical iOS launches:
                 TimeSpan.FromSeconds(adapterConnectionTimeoutSeconds));
             try
             {
-                await Task.Delay(5000); //Give app some time to start up
-                await runner.RunTests(outputFilename, settingsXml, processExitCancellationTokenSource?.Token ?? CancellationToken.None, appLogFilename);
+                await Task.Delay(5000, cancellationToken); //Give app some time to start up
+                await runner.RunTests(outputFilename, settingsXml, cancellationToken, appLogFilename);
             }
             catch(System.Exception ex)
             {
@@ -656,7 +700,8 @@ Application arguments for physical iOS launches:
             }
             if (e.Tag == "ActivityManager" && msg.StartsWith($"Displayed {apk_id}/{activityName}"))
             {
-                _ = OnApplicationLaunched(); //Detect app launched and start VSTest connection
+                _ = OnApplicationLaunched(
+                    cancellationToken: processExitCancellationTokenSource?.Token ?? CancellationToken.None); //Detect app launched and start VSTest connection
                 return;
             }
             if (processID > 0 && e.Tag == "ActivityManager" && msg == $"Process {apk_id} (pid {processID}) has died.")

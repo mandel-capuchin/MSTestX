@@ -17,6 +17,9 @@ using Microsoft.VisualStudio.TestPlatform.ObjectModel;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
 
 namespace MSTestX.Console.Tests;
 
@@ -144,6 +147,51 @@ public class ProgramTests
         });
 
         CollectionAssert.AreEqual(new[] { "first", "second", "third" }, attempted);
+    }
+
+    [TestMethod]
+    public async Task WaitForRemoteEndpointAsync_PropagatesCallerCancellation()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        using var cancellationTokenSource = new CancellationTokenSource();
+        var waitTask = Program.WaitForRemoteEndpointAsync(
+            listener,
+            TimeSpan.FromSeconds(5),
+            cancellationTokenSource.Token);
+
+        cancellationTokenSource.Cancel();
+
+        await Assert.ThrowsExceptionAsync<OperationCanceledException>(() => waitTask);
+    }
+
+    [TestMethod]
+    public async Task WaitForRemoteEndpointAsync_ReportsTimeoutSeparatelyFromCallerCancellation()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+
+        await Assert.ThrowsExceptionAsync<TimeoutException>(() =>
+            Program.WaitForRemoteEndpointAsync(
+                listener,
+                TimeSpan.FromMilliseconds(50),
+                CancellationToken.None));
+    }
+
+    [TestMethod]
+    public async Task WaitForRemoteEndpointAsync_ReturnsAdapterPortForConnectedHost()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        var waitTask = Program.WaitForRemoteEndpointAsync(
+            listener,
+            TimeSpan.FromSeconds(5),
+            CancellationToken.None);
+        var listenerEndpoint = (IPEndPoint)listener.LocalEndpoint;
+        using var client = new TcpClient();
+
+        await client.ConnectAsync(listenerEndpoint.Address, listenerEndpoint.Port);
+        var adapterEndpoint = await waitTask;
+
+        Assert.AreEqual(IPAddress.Loopback, adapterEndpoint.Address);
+        Assert.AreEqual(38300, adapterEndpoint.Port);
     }
 
     [TestMethod]
