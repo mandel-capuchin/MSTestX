@@ -6,33 +6,65 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: true
+
 jobs:
-
   build:
-
-    strategy:
-      matrix:
-        configuration: [Release]
-
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 60
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-        submodules: true
-        
-    - name: Setup Visual Studio Command Prompt
-      uses: microsoft/setup-msbuild@v1.1
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
 
-    - name: Build
-      run: |
-        dotnet workload restore src/MSTestX.sln
-        msbuild /restore /t:Build src/MSTestX.sln /p:Configuration=Release /p:SkipWindows=True
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.402
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: NuGet Packages
-        path: nupkg
+      - name: Test console runner
+        shell: pwsh
+        run: |
+          dotnet test Automation/MSTestX.Console.Tests/MSTestX.Console.Tests.csproj `
+            --configuration Release `
+            --nologo
+          if ($LASTEXITCODE -ne 0) { throw 'Console runner tests failed.' }
+
+      - name: Restore workloads and solution
+        shell: pwsh
+        run: |
+          dotnet workload restore src/MSTestX.sln
+          if ($LASTEXITCODE -ne 0) { throw 'Workload restore failed.' }
+          dotnet restore src/MSTestX.sln -p:SkipWindows=true
+          if ($LASTEXITCODE -ne 0) { throw 'Solution restore failed.' }
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          dotnet build src/MSTestX.sln `
+            --configuration Release `
+            --no-restore `
+            --nologo `
+            -p:SkipWindows=true `
+            -p:ContinuousIntegrationBuild=true
+          if ($LASTEXITCODE -ne 0) { throw 'Solution build failed.' }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: NuGet Packages
+          path: nupkg
+          if-no-files-found: error
