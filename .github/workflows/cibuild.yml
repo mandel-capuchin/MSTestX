@@ -43,20 +43,17 @@ jobs:
             --nologo
           if ($LASTEXITCODE -ne 0) { throw 'Console runner tests failed.' }
 
-      - name: Restore workloads and solution
+      - name: Restore workloads
         shell: pwsh
         run: |
           dotnet workload restore src/MSTestX.sln
           if ($LASTEXITCODE -ne 0) { throw 'Workload restore failed.' }
-          dotnet restore src/MSTestX.sln -p:SkipWindows=true
-          if ($LASTEXITCODE -ne 0) { throw 'Solution restore failed.' }
 
       - name: Build solution
         shell: pwsh
         run: |
           dotnet build src/MSTestX.sln `
             --configuration Release `
-            --no-restore `
             --nologo `
             -p:SkipWindows=true `
             -p:ContinuousIntegrationBuild=true
