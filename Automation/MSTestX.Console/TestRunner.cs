@@ -187,16 +187,11 @@ namespace MSTestX.Console
 
         internal static bool IsUnsuccessfulCompletion(TestRunCompleteEventArgs completion)
         {
+            // Assertion failures are a successfully completed test run. The process contract
+            // reserves failure for runner/test-host errors, aborts, and cancellations.
             return completion?.Error != null
                 || completion?.IsAborted == true
                 || completion?.IsCanceled == true;
-        }
-
-        internal static bool HasFailedTests(ITestRunStatistics statistics)
-        {
-            return GetOutcomeCount(
-                statistics,
-                Microsoft.VisualStudio.TestPlatform.ObjectModel.TestOutcome.Failed) > 0;
         }
 
         internal static string FormatCompletionFailureMessage(TestRunCompleteEventArgs completion)

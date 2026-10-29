@@ -366,29 +366,7 @@ public class TestRunnerTests
     }
 
     [TestMethod]
-    public void HasFailedTests_ReturnsTrue_OnlyWhenFailedOutcomeCountIsPositive()
-    {
-        var passingStatistics = new TestRunStatistics(
-            executedTests: 2,
-            new Dictionary<TestOutcome, long>
-            {
-                [TestOutcome.Passed] = 2
-            });
-        var failingStatistics = new TestRunStatistics(
-            executedTests: 2,
-            new Dictionary<TestOutcome, long>
-            {
-                [TestOutcome.Passed] = 1,
-                [TestOutcome.Failed] = 1
-            });
-
-        Assert.IsFalse(TestRunner.HasFailedTests(null));
-        Assert.IsFalse(TestRunner.HasFailedTests(passingStatistics));
-        Assert.IsTrue(TestRunner.HasFailedTests(failingStatistics));
-    }
-
-    [TestMethod]
-    public void CompletedAssertionFailures_AreNotAnInfrastructureFailure()
+    public void CompletedAssertionFailures_PreserveSuccessfulProcessContract()
     {
         var completion = new TestRunCompleteEventArgs(
             new TestRunStatistics(

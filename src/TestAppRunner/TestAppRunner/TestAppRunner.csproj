@@ -1,9 +1,9 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks Condition="'$(MSTestXTargetFrameworks)' == ''">net11.0-ios26.5;net11.0-android37.0;net11.0-maccatalyst26.5</TargetFrameworks>
+    <TargetFrameworks Condition="'$(MSTestXTargetFrameworks)' == ''">$(MSTestXMobileTargetFrameworks)</TargetFrameworks>
     <TargetFrameworks Condition="'$(MSTestXTargetFrameworks)' != ''">$(MSTestXTargetFrameworks)</TargetFrameworks>
-    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows')) AND '$(MSTestXTargetFrameworks)' == ''">$(TargetFrameworks);net11.0-windows10.0.19041.0</TargetFrameworks>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows')) AND '$(MSTestXTargetFrameworks)' == '' AND '$(SkipWindows)' != 'True'">$(TargetFrameworks);$(MSTestXWindowsTargetFramework)</TargetFrameworks>
     <GeneratePackageOnBuild Condition="'$(Configuration)'=='Release'">true</GeneratePackageOnBuild>
     <PackageId>MSTestX.UnitTestRunner</PackageId>
     <AssemblyName>MSTestX.UnitTestRunner</AssemblyName>
@@ -70,7 +70,7 @@
     <PackageReference Include="sqlite-net-pcl" Version="1.8.116" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="All" />
-    <PackageReference Include="Microsoft.Maui.Controls" Version="8.0.3" />
+    <PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
   </ItemGroup>
 
   <ItemGroup>

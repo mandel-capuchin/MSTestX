@@ -3,6 +3,10 @@
   <PropertyGroup>
     <MSTestXAdapterVersion>3.6.0</MSTestXAdapterVersion>
     <MSTextXRunnerVersion>2.0.1</MSTextXRunnerVersion>
+    <MSTestXNetTarget>net10.0</MSTestXNetTarget>
+    <MSTestXMobileTargetFrameworks>$(MSTestXNetTarget)-ios26.0;$(MSTestXNetTarget)-android36.0;$(MSTestXNetTarget)-maccatalyst26.0</MSTestXMobileTargetFrameworks>
+    <MSTestXWindowsTargetFramework>$(MSTestXNetTarget)-windows10.0.19041.0</MSTestXWindowsTargetFramework>
+    <MauiVersion>10.0.40</MauiVersion>
   </PropertyGroup>
 
 </Project>

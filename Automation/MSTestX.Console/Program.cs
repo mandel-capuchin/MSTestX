@@ -550,6 +550,8 @@ Application arguments for physical iOS launches:
             if (appLaunchDetected)
                 return;
             appLaunchDetected = true;
+            // Exit-code contract: any completed test run returns 0, including runs with failed
+            // assertions. Only runner/test-host failures caught below return 1.
             int result = 0;
             var runner = new TestRunner(
                 endpoint,
